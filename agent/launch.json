@@ -1,0 +1,5 @@
+{
+  "command": "node",
+  "args": ["app/src/server.mjs", "--no-open"],
+  "ready_port": 4321
+}

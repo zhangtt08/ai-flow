@@ -1,0 +1,16 @@
+﻿{
+  "name": "ai-flow",
+  "version": "1.10.2",
+  "private": true,
+  "type": "module",
+  "description": "AI Flow - 定时访问多个已登录 AI 网页并汇总回答的本地工作台",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node test/selection-check.mjs",
+    "agent:serve": "node src/server.mjs --no-open",
+    "agent:mcp": "node ../agent/mcp-server.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.56.0"
+  }
+}

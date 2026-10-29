@@ -1,0 +1,18 @@
+# 依赖与运行时
+app/node_modules/
+node/
+app/data/
+agent/.endpoint
+
+# 打包产物（从 Releases 下载）
+*.exe
+*.dll
+*.zip
+*.log
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 运行态端点文件
+**/agent/.endpoint
