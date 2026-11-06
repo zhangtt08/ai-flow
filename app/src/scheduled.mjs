@@ -305,7 +305,8 @@ export async function readScheduledSource({ browser, platform, source, watermark
       if (!text) {
         throw new AdapterError('AUTOMATION_EMPTY', 'Grok 自动化已经打开，但这次运行还没有文字内容。');
       }
-      const messages = [{ index: 1, text, time: null }];
+      // 带上这次运行的创建时间：正文没变但确实又跑了一次时，靠它识别成新的。
+      const messages = [{ index: 1, text, time: picked.time || null }];
       const decision = pickNewAnswers(watermark, messages, 'latest');
       const snapshot = snapshotOf(messages);
       if (!decision.items.length) {
@@ -316,7 +317,7 @@ export async function readScheduledSource({ browser, platform, source, watermark
           newCount: 0,
           totalCount: 1,
           snapshot,
-          lastTime: null,
+          lastTime: picked.time || null,
           url: picked.url
         };
       }
@@ -324,11 +325,11 @@ export async function readScheduledSource({ browser, platform, source, watermark
         state: 'new',
         reason: decision.reason,
         text,
-        answers: [{ index: 1, time: null, text }],
+        answers: [{ index: 1, time: picked.time || null, text }],
         newCount: 1,
         totalCount: 1,
         snapshot,
-        lastTime: null,
+        lastTime: picked.time || null,
         url: picked.url
       };
     }

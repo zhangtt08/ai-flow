@@ -402,11 +402,20 @@ function renderTopbar() {
   else dot.hidden = true;
 }
 
+let renderedView = null;
+
 function renderView() {
   if (!state.data) return;
   if (state.view === 'settings' && state.settingsDirty) return;
   closePopover();
   const view = document.getElementById('view');
+  // 采集期间状态事件每秒多条，整页 innerHTML 重建会把正在输入的焦点丢掉
+  // （历史页搜索框里打字每秒断一次）；正在 #view 里编辑时跳过本轮，失焦后下一拍刷新。
+  const ae = document.activeElement;
+  const editing = ae
+    && view.contains(ae)
+    && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT' || ae.isContentEditable);
+  if (editing) return;
   let html = '';
   if (state.view === 'home') html = renderHome();
   else if (state.view === 'tasks') html = renderTasks();
@@ -415,9 +424,13 @@ function renderView() {
   else if (state.view === 'settings') html = renderSettings();
   view.innerHTML = html;
   if (state.view === 'settings') bindSettings();
-  view.classList.remove('view');
-  void view.offsetWidth;
-  view.classList.add('view');
+  // 入场动画只在切换视图时重放；以前每个状态事件都强制重排+重放，运行中整页每秒闪一次
+  if (renderedView !== state.view) {
+    view.classList.remove('view');
+    void view.offsetWidth;
+    view.classList.add('view');
+    renderedView = state.view;
+  }
 }
 
 function needsLoginSetup() {
@@ -1157,7 +1170,7 @@ function sourceRowHtml(platforms, source = {}, index = 0) {
     </div>
     <label class="source-field">
       <span>定时对话链接</span>
-      <input class="text-input" data-source-url value="${esc(source.url || '')}" placeholder="https://… 打开那条定时对话后复制地址；Grok 填 https://grok.com/automations">
+      <input class="text-input" data-source-url value="${esc(source.url || '')}" placeholder="https://… 打开那条定时对话后复制地址；Grok 填 https://grok.com/automations（自动化页在「设置 → 自动化」里）">
     </label>
     <label class="source-field">
       <span>或标题关键词</span>
@@ -1242,7 +1255,7 @@ function openTaskModal(taskId = null) {
               <button type="button" class="${mode === 'scheduled' ? 'active' : ''}" data-mode="scheduled">读取定时回答</button>
               <button type="button" class="${mode === 'prompt' ? 'active' : ''}" data-mode="prompt">发送提示词</button>
             </div>
-            <div class="form-hint" data-mode-hint="scheduled">工具只读取那条定时对话里已经出现的回答，不会替你发新问题。Grok 自动化任务请填 <code>https://grok.com/automations</code>，关键词填任务标题（例如「全球趋势雷达 19:00」）。</div>
+            <div class="form-hint" data-mode-hint="scheduled">工具只读取那条定时对话里已经出现的回答，不会替你发新问题。Grok 的自动化入口已挪到「设置 → 自动化」，链接仍填 <code>https://grok.com/automations</code>，关键词填自动化名称（例如「VALORANT VCT全天情报」）。程序会直接读取 Grok 的运行记录，取最近一次成功运行的那份报告，不再需要点「运行历史」。</div>
             <div class="form-hint" data-mode-hint="prompt" hidden>同一个提示词依次发送给选中的 AI，并继续发到各自已绑定的同一条对话；第一次运行会自动新建并记住。</div>
           </div>
           ${isEdit ? '' : `<div class="span-2">
@@ -2369,7 +2382,12 @@ let windowChromeReady = false;
 function initWindowChrome() {
   if (windowChromeReady) return;
   windowChromeReady = true;
-  window.addEventListener('resize', syncWindowState);
+  // 拖拽窗口边框时 resize 每帧触发；syncWindowState 是一次 Tauri IPC 往返，防抖到 150ms
+  let resizeTimer = 0;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(syncWindowState, 150);
+  });
   syncWindowState();
 }
 
@@ -2411,9 +2429,26 @@ function shutdownApp() {
   });
 }
 
+// 这些动作背后是"开浏览器/发请求"的重活，请求期间禁用按钮：连点会开多轮采集或检查
+const BUSY_ACTIONS = new Set(['run-task', 'rerun-task', 'stop-waiting', 'check-all']);
+
 async function handleAction(element) {
   const action = element.dataset.action;
   const id = element.dataset.id;
+  if (BUSY_ACTIONS.has(action)) {
+    if (element.disabled) return;
+    element.disabled = true;
+    try {
+      await dispatchAction(action, id, element);
+    } finally {
+      element.disabled = false;
+    }
+    return;
+  }
+  await dispatchAction(action, id, element);
+}
+
+async function dispatchAction(action, id, element) {
   switch (action) {
     case 'new-task':
       openTaskModal();

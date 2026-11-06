@@ -533,22 +533,6 @@ export async function dismissConsent(page) {
   }
 }
 
-// Grok 创建自动化后会弹“自动化权限”确认框；它会挡住运行列表。
-// 这里只负责关掉（Esc），不替用户授权；关不掉就给明确提示，避免被误判成“找不到运行”。
-async function dismissGrokDialog(page) {
-  const body = await readVisibleMainText(page).catch(() => '');
-  if (!/全部允许|全部拒绝|确认我的选择/.test(body)) return;
-  await page.keyboard.press('Escape').catch(() => {});
-  await sleep(800);
-  const after = await readVisibleMainText(page).catch(() => '');
-  if (/全部允许|全部拒绝|确认我的选择/.test(after)) {
-    throw new AdapterError(
-      'AUTOMATION_PERMISSION',
-      'Grok 弹出了「自动化权限」确认框，挡住了运行列表。请在自动化浏览器里手动处理一次（允许或拒绝），之后再运行采集。'
-    );
-  }
-}
-
 export async function findComposer(page, adapter, timeoutMs = 0) {
   const deadline = Date.now() + timeoutMs;
   do {
@@ -1014,9 +998,13 @@ export async function readAnswerMessages(page, adapter) {
   }
   if (!locator) return { selector: null, messages: [] };
 
+  // 调用方（pickReport）只看最后 windowSize=15 条；对话累积多天后逐条 evaluate
+  // 全部消息（每条 3 次往返）是纯浪费。这里只读最后 20 条：够 15 条窗口用，
+  // 多出的 5 条兜住「外层容器/内层正文」跨窗口边界的嵌套去重。
+  const firstIndex = Math.max(0, count - 20);
   const markers = adapter.userMarkers || [];
   const collected = [];
-  for (let index = 0; index < count; index += 1) {
+  for (let index = firstIndex; index < count; index += 1) {
     const element = locator.nth(index);
     // 用户消息判定：节点“自己”就是用户气泡，或者只含用户气泡而没有别的正文。
     // 不能因为子孙里有一个用户气泡就把整页容器判成用户消息（manus 踩过）。
@@ -1290,68 +1278,97 @@ export async function inlineRemoteImages(text, page, { limit = 6, maxBytes = 300
 }
 
 // —— Grok 自动化任务 ——
-// 页面路径：grok.com/automations → 「运行」列表 → 点开最新一条运行 → 项目/对话里是文字汇总。
-// 只对 grok.com/automations 生效；其它平台仍走普通对话读取。
+// 2026-11 改版：grok.com/automations 现在渲染成「设置 → 自动化」弹窗，
+// 原来的「运行」列表 tab 已经没了（每行只剩 暂停 / 立即运行 / 编辑 / 删除），
+// 所以按以前那样「点运行行 → 打开对话」已经不可能。但后台接口都还在，而且比点 DOM 稳得多：
+//   GET /rest/automations                → [{ taskId, content:{ name }, isActive, schedules:[{ nextRun, timeOfDay, timezone }] }]
+//   GET /rest/automations/{taskId}/runs   → [{ taskResultId, title, conversationId, status, createTime, execTime }]（按时间倒序）
+//   GET https://grok.com/chat/{conversationId} → 那一次运行的对话（回答仍是 [data-testid="assistant-message"]）
+// 现在先用同源 fetch 问「最新一次成功运行是哪一条」，再直接打开那条运行的对话读正文，
+// 不用点设置、不用切 tab、也不用管弹窗。
 export function isGrokAutomationSource(platform, source = {}) {
-  return platform?.adapterId === 'grok' && /grok\.com\/automations/i.test(String(source.url || ''));
+  return (
+    platform?.adapterId === 'grok' &&
+    /grok\.com\/(?:[a-z0-9._-]+\/)*automations?(?:[/?#]|$)/i.test(String(source.url || ''))
+  );
 }
 
-async function clickText(page, text, { exact = true, timeout = 4000 } = {}) {
-  const locator = page.getByText(text, { exact }).first();
-  if (!(await locator.isVisible().catch(() => false))) return false;
-  await locator.click({ timeout }).catch(() => {});
-  await sleep(1200);
-  return true;
+const GROK_RUN_SUCCESS = 'TASK_RESULT_SUCCESS';
+
+function grokNameKey(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[\s\u3000]+/g, '');
 }
 
-async function clickRowContaining(page, keyword) {
-  // 已实测：Grok 的运行列表每行是一个 <button>（不是 tr），整行文字包含自动化名称和时间。
-  for (const selector of ['button', 'tr', '[role="row"]', 'li']) {
-    const rows = page.locator(selector);
-    const count = Math.min(await rows.count().catch(() => 0), 120);
-    for (let index = 0; index < count; index += 1) {
-      const row = rows.nth(index);
-      if (!(await row.isVisible().catch(() => false))) continue;
-      const text = (await row.innerText().catch(() => '')).replace(/\s+/g, ' ');
-      if (!text || !text.includes(keyword)) continue;
-      if (text.length > 300) continue; // 跳过整页容器
-      const link = row.locator('a').first();
-      if (await link.count().catch(() => 0)) await link.click({ timeout: 5000 }).catch(() => {});
-      else await row.click({ timeout: 5000 }).catch(() => {});
-      await sleep(1500);
-      return true;
-    }
+// 同源 fetch：页面本身就在 grok.com 上，Cookie / 登录态自动带上，不需要额外鉴权头。
+async function grokFetchJson(page, path, { attempts = 3 } = {}) {
+  let last = { status: 0, json: null, head: 'fetch 未执行' };
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    last = await page
+      .evaluate(async (requestPath) => {
+        try {
+          const res = await fetch(requestPath, {
+            credentials: 'include',
+            headers: { accept: 'application/json' }
+          });
+          const text = await res.text();
+          let json = null;
+          try {
+            json = JSON.parse(text);
+          } catch {
+            json = null;
+          }
+          return { status: res.status, json, head: text.slice(0, 300) };
+        } catch (error) {
+          return { status: 0, json: null, head: String((error && error.message) || error) };
+        }
+      }, path)
+      .catch((error) => ({ status: 0, json: null, head: String((error && error.message) || error) }));
+    if (last.status === 200 && last.json) return last;
+    // 401/403 重试也没用，直接交回给调用方报登录问题。
+    if (last.status === 401 || last.status === 403) return last;
+    if (attempt < attempts - 1) await sleep(1200);
   }
-  return false;
+  return last;
 }
 
-const RUN_TIME_HINT = /(AM|PM|小时|分钟|昨天|Oct|Nov|Dec|月\s*\d|\d{1,2}:\d{2})/i;
+async function listGrokAutomations(page) {
+  const res = await grokFetchJson(page, '/rest/automations');
+  if (res.status === 401 || res.status === 403) {
+    throw new LoginRequiredError(`Grok 自动化接口要求登录（HTTP ${res.status}），请先在「AI 平台」里登录 Grok。`);
+  }
+  if (res.status !== 200 || !res.json) {
+    throw new AdapterError(
+      'AUTOMATION_API',
+      `读取 Grok 自动化列表失败（HTTP ${res.status}）：${String(res.head || '').replace(/\s+/g, ' ').slice(0, 120)}`
+    );
+  }
+  return Array.isArray(res.json.automations) ? res.json.automations : [];
+}
 
-async function clickFirstRunRow(page) {
-  for (const selector of ['table tbody tr', '[role="row"]']) {
-    const rows = page.locator(selector);
-    const count = Math.min(await rows.count().catch(() => 0), 5);
-    for (let index = 0; index < count; index += 1) {
-      const row = rows.nth(index);
-      if (!(await row.isVisible().catch(() => false))) continue;
-      await row.click({ timeout: 5000 }).catch(() => {});
-      await sleep(1500);
-      return true;
-    }
+// 关键词 → 自动化：先找完全同名，再找互相包含；都没有就返回 null（由调用方报出「现有名称」）。
+function pickGrokAutomation(automations, keyword) {
+  const wanted = grokNameKey(keyword);
+  if (!wanted) return automations[0] || null;
+  const hits = [];
+  for (const item of automations) {
+    const name = grokNameKey(item?.content?.name);
+    if (!name) continue;
+    if (name === wanted) hits.push({ item, score: 3, length: name.length });
+    else if (name.includes(wanted) || wanted.includes(name)) hits.push({ item, score: 2, length: name.length });
   }
-  const buttons = page.locator('button');
-  const count = Math.min(await buttons.count().catch(() => 0), 120);
-  for (let index = 0; index < count; index += 1) {
-    const row = buttons.nth(index);
-    if (!(await row.isVisible().catch(() => false))) continue;
-    const text = (await row.innerText().catch(() => '')).replace(/\s+/g, ' ');
-    if (text.length < 10 || text.length > 200) continue;
-    if (!RUN_TIME_HINT.test(text)) continue;
-    await row.click({ timeout: 5000 }).catch(() => {});
-    await sleep(1500);
-    return true;
-  }
-  return false;
+  hits.sort((a, b) => b.score - a.score || b.length - a.length);
+  return hits[0]?.item || null;
+}
+
+async function listGrokRuns(page, taskId) {
+  const res = await grokFetchJson(page, `/rest/automations/${encodeURIComponent(taskId)}/runs`);
+  if (res.status !== 200 || !res.json) return { runs: [], error: `HTTP ${res.status}` };
+  const runs = Array.isArray(res.json.runs) ? res.json.runs.slice() : [];
+  // 接口本身是倒序，这里再排一次，避免以后顺序变化把旧运行当成新的。
+  runs.sort((a, b) => new Date(b?.createTime || 0).getTime() - new Date(a?.createTime || 0).getTime());
+  return { runs };
 }
 
 async function readVisibleMainText(page) {
@@ -1389,125 +1406,98 @@ export async function scrollConversationToEnd(page) {
     .catch(() => {});
 }
 
-// 「运行」tab 才是运行历史；「自动化任务」tab 有模板区，用这个区分。
-async function openRunsTab(page) {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const tab = page.getByRole('tab', { name: '运行', exact: true }).first();
-    if (await tab.count().catch(() => 0)) await tab.click({ timeout: 4000 }).catch(() => {});
-    else await clickText(page, '运行', { exact: true });
-    await sleep(1200);
-    const text = await readVisibleMainText(page);
-    if (text && !text.includes('模板')) return true;
-  }
-  return false;
-}
-
 export async function readGrokAutomation(page, adapter, source = {}) {
   const keyword = String(source.keyword || '').trim();
   const listUrl = /grok\.com\/automations/i.test(String(source.url || ''))
     ? source.url
     : adapter.automationsUrl || 'https://grok.com/automations';
 
+  // 先把页面放到 grok.com 上（同源 fetch 需要它），设置弹窗渲不渲染都不影响读取。
   await navigate(page, listUrl);
-  // 这是 SPA：等页面把自动化列表渲染出来，而不是固定睡死。
-  const readyDeadline = Date.now() + 20_000;
-  while (Date.now() < readyDeadline) {
-    const text = await readVisibleMainText(page).catch(() => '');
-    if (text.includes('自动化') && text.length > 100) break;
-    await sleep(1000);
-  }
-  await dismissConsent(page);
-
   if (looksLikeAuthUrl(page.url())) {
     throw new LoginRequiredError('Grok 自动化页跳到了登录地址，请先在「AI 平台」里登录 Grok。');
   }
+  await sleep(1500);
+  await dismissConsent(page);
 
-  // 还没有任何运行记录：任务页也会显示「0 次运行」，不用切 tab、也不用扫按钮，直接返回。
-  const taskPageText = await readVisibleMainText(page).catch(() => '');
-  if (/0 次运行|暂无运行|还没有运行|No runs yet/i.test(taskPageText)) {
-    return { text: '', url: page.url(), messages: [], empty: true, reason: 'no-runs' };
-  }
-
-  const runsReady = await openRunsTab(page);
-  if (!runsReady) {
-    throw new AdapterError(
-      'AUTOMATION_EMPTY',
-      'Grok 自动化页打开了，但没有找到「运行」列表。请确认账号里已经有自动化任务（https://grok.com/automations）；Grok 会拦截无头浏览器，请在设置里保持「显示浏览器窗口」开启。'
-    );
-  }
-
-  // Grok 有时会弹出“自动化权限”确认框挡住列表；先关掉，关不掉就明确提示。
-  await dismissGrokDialog(page);
-
-  // 还没有任何运行记录不是错误：第一次运行前就该是空的，交给上层按等待窗口重试。
-  const listText = await readVisibleMainText(page).catch(() => '');
-  if (/0 次运行|暂无运行|还没有运行|No runs yet/i.test(listText)) {
-    return { text: '', url: page.url(), messages: [], empty: true, reason: 'no-runs' };
-  }
-
-  // 点击可能新开标签页；先挂监听，避免弹窗已经打开才注册。
-  const popupPromise = page.context().waitForEvent('page', { timeout: 5000 }).catch(() => null);
-  let clicked = keyword ? await clickRowContaining(page, keyword) : false;
-  if (!clicked && !keyword) clicked = await clickFirstRunRow(page);
-
-  if (!clicked) {
-    const body = await readVisibleMainText(page).catch(() => '');
+  const automations = await listGrokAutomations(page);
+  if (!automations.length) {
     throw new AdapterError(
       'AUTOMATION_NOT_FOUND',
-      `Grok 运行列表里没有找到包含「${keyword || '（未填关键词）'}」的运行。请把关键词写得接近自动化任务名称（例如「全球趋势雷达 19:00」）。当前页面摘录：${String(body).replace(/\s+/g, ' ').slice(0, 140)}`
+      'Grok 账号里还没有自动化任务。请先在 grok.com 的「设置 → 自动化」里创建，再回来采集。'
+    );
+  }
+  const automation = pickGrokAutomation(automations, keyword);
+  if (!automation) {
+    const names = automations.map((item) => item?.content?.name).filter(Boolean).join('、');
+    throw new AdapterError(
+      'AUTOMATION_NOT_FOUND',
+      `Grok 里没有名称包含「${keyword}」的自动化。账号里现有的自动化：${names || '（无）'}。请把关键词改成任务名的一部分（例如「VALORANT VCT全天情报」）。`
     );
   }
 
-  const popup = await popupPromise;
-  let target = page;
-  if (popup && !popup.isClosed()) {
-    target = popup;
-    await target.waitForLoadState('domcontentloaded', { timeout: 15_000 }).catch(() => {});
+  const automationName = String(automation.content?.name || '');
+  const { runs } = await listGrokRuns(page, automation.taskId);
+  // 只认已经跑完的运行：还在跑的那条没有正文，等下一轮轮询再来。
+  const usable = runs.filter(
+    (run) => run && run.conversationId && (!run.status || run.status === GROK_RUN_SUCCESS)
+  );
+  if (!usable.length) {
+    // 还没跑过 / 正在跑：不是错误，按「还没有内容」交给等待窗口重试。
+    return { text: '', url: page.url(), messages: [], empty: true, reason: 'no-runs', automationName };
   }
 
-  // 点开之后读回答；真实页面里回答是 [data-testid="assistant-message"]。
+  const run = usable[0];
+  const conversationUrl = `https://grok.com/chat/${run.conversationId}`;
+  // 直接打开这次运行的对话（会自动跳到 /c/<id>?rid=…），回答仍是 assistant-message。
+  await navigate(page, conversationUrl);
+  await page
+    .waitForSelector('[data-testid="assistant-message"]', { timeout: 25_000 })
+    .catch(() => {});
+  await scrollConversationToEnd(page);
+
   const started = Date.now();
-  const deadline = started + 25_000;
+  const deadline = started + 12_000;
   let messages = [];
+  let excerpt = '';
   while (Date.now() < deadline) {
-    if (target.isClosed()) break;
-    if (looksLikeAuthUrl(target.url())) {
-      throw new LoginRequiredError('Grok 自动化页要求重新登录，请先在「AI 平台」里登录。');
+    if (page.isClosed()) {
+      throw new AdapterError('PAGE_CLOSED', '读取 Grok 自动化运行时页面被关掉了，本次先跳过这条来源。');
     }
-    const read = await readAnswerMessages(target, adapter);
+    if (looksLikeAuthUrl(page.url())) {
+      throw new LoginRequiredError('Grok 要求重新登录，请先在「AI 平台」里登录。');
+    }
+    const read = await readAnswerMessages(page, adapter);
     if (read.messages.length) {
       messages = read.messages;
       break;
     }
-    if (Date.now() - started > 8000) {
-      const body = await readVisibleMainText(target);
-      const text = sanitizeAnswer(body);
-      let onAutomationList = true;
-      try {
-        onAutomationList = /\/automations(\/|$)/i.test(new URL(target.url()).pathname);
-      } catch {
-        onAutomationList = false;
-      }
-      if (text.length > 200 && !onAutomationList) {
-        return { text, url: target.url(), messages: [] };
-      }
-    }
+    excerpt = (await readVisibleMainText(page).catch(() => '')).replace(/\s+/g, ' ').slice(0, 160);
     await sleep(1000);
   }
 
   if (!messages.length) {
-    const body = await readVisibleMainText(target).catch(() => '');
     throw new AdapterError(
       'AUTOMATION_EMPTY',
-      `已经打开 Grok 自动化运行，但没有读到汇总正文（${target.url().slice(0, 120)}）。请确认这次运行已经完成。页面摘录：${String(body).replace(/\s+/g, ' ').slice(0, 120)}`
+      `已打开 Grok 自动化「${automationName}」这次的运行，但没读到正文（${conversationUrl}）。请确认这次运行已经完成。页面摘录：${excerpt}`
     );
   }
 
   const text = messages.map((item) => item.text).join('\n\n');
   return {
     text,
-    url: target.url(),
+    url: page.url(),
     messages,
-    key: `${keyword || 'automation'}:${sanitizeAnswer(text).slice(0, 40)}`
+    // 这次运行的创建时间：watermark 靠它判断「是不是新的一次运行」，
+    // 正文完全一样（比如同一天补跑）时也能识别成新的一次。
+    time: run.createTime || null,
+    key: `${keyword || automationName || 'automation'}:${run.taskResultId}`,
+    automationName,
+    run: {
+      taskResultId: run.taskResultId || '',
+      title: run.title || '',
+      createTime: run.createTime || null,
+      taskId: automation.taskId
+    }
   };
 }

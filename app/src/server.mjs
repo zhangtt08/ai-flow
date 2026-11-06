@@ -1,6 +1,7 @@
 ﻿import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Store, DEFAULT_PLATFORMS, normalizeSummaryConversation } from './store.mjs';
 import { Engine } from './engine.mjs';
@@ -15,7 +16,7 @@ const DATA_DIR = process.env.AI_FLOW_DATA_DIR ? path.resolve(process.env.AI_FLOW
 const PORT = Number(process.env.AI_FLOW_PORT) || 4321;
 const HOST = '127.0.0.1';
 const BASE_URL = `http://${HOST}:${PORT}`;
-const APP_VERSION = '1.10.2';
+const APP_VERSION = '1.10.3';
 
 ensureDir(DATA_DIR);
 const LOG_FILE = path.join(DATA_DIR, 'ai-flow.log');
@@ -24,6 +25,21 @@ function log(...args) {
   const line = `[${new Date().toISOString()}] ${args.map(String).join(' ')}`;
   console.log(line);
   try {
+    // 长期驻留的日志要有上限：超过 2MB 把旧日志改名 .old，本轮日志从头写，
+    // 否则文件会无限增长（常驻服务按月跑时能滚到几百 MB）。
+    try {
+      const size = fs.statSync(LOG_FILE).size;
+      if (size > 2 * 1024 * 1024) {
+        try {
+          fs.unlinkSync(`${LOG_FILE}.old`);
+        } catch {
+          // 没有 .old 就直接改名
+        }
+        fs.renameSync(LOG_FILE, `${LOG_FILE}.old`);
+      }
+    } catch {
+      // 文件还不存在，正常
+    }
     fs.appendFileSync(LOG_FILE, `${line}\n`, 'utf8');
   } catch {
     // 忽略日志写入失败
@@ -874,6 +890,53 @@ function queueShutdown() {
   }, 250);
 }
 
+// 桌面外壳（AI Flow.exe）被强杀/崩溃时，Node 后端会变成孤儿进程，
+// 一直占着单实例锁，导致下次双击 exe 静默退出（表现为“打不开”）。
+// 进程链是 node.real.exe → node.exe(包装器) → AI Flow.exe，所以要向上找到外壳再监视。
+function findShellPid() {
+  if (process.env.AI_FLOW_DESKTOP !== '1') return 0;
+  try {
+    const script = `
+$target = ${process.pid}
+for ($i = 0; $i -lt 6; $i++) {
+  $p = Get-CimInstance Win32_Process -Filter "ProcessId=$target" -ErrorAction SilentlyContinue
+  if (-not $p) { break }
+  if ($p.Name -eq 'AI Flow.exe') { $p.ProcessId; break }
+  $target = $p.ParentProcessId
+  if (-not $target) { break }
+}
+`;
+    const out = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], {
+      encoding: 'utf8',
+      timeout: 8000,
+      windowsHide: true
+    }).trim();
+    return Number(out) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+// 外壳 PID 探测要起一次 PowerShell（冷启动 1-2 秒），不能挡在 server.listen
+// 之前——推迟到端口已监听、页面已可访问之后，异步补上孤儿自检。
+function startShellWatchdog() {
+  let SHELL_PID = 0;
+  try {
+    SHELL_PID = findShellPid();
+  } catch {
+    return;
+  }
+  if (!SHELL_PID) return;
+  setInterval(() => {
+    try {
+      process.kill(SHELL_PID, 0);
+    } catch {
+      log(`parent shell gone (pid ${SHELL_PID}), exiting to release single-instance lock`);
+      queueShutdown();
+    }
+  }, 5000).unref();
+}
+
 async function openExistingInstance() {
   clearInterval(heartbeat);
   try {
@@ -903,6 +966,7 @@ server.on('error', (error) => {
 server.listen(PORT, HOST, () => {
   log(`AI Flow ${APP_VERSION} listening on ${BASE_URL}`);
   log(`data: ${DATA_DIR}`);
+  startShellWatchdog();
   try {
     const epDirs = [
       path.join(ROOT, '..', 'agent'),

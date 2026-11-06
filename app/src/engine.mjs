@@ -769,6 +769,7 @@ export class Engine {
     // 每个来源各自的下一次尝试时间。失败的来源按自己的节奏马上重开页面重试，
     // 不会被别的慢来源拖住，也不用等满 pollMinutes（之前就是卡在这里）。
     const nextAttemptAt = new Map([...pending].map((index) => [index, 0]));
+    let lastWaitPersist = 0;
 
     if (!pending.size) {
       run.progress.done = plan.length;
@@ -795,8 +796,14 @@ export class Engine {
         const earliest = Math.min(...[...pending].map((index) => nextAttemptAt.get(index) || now));
         const waitMs = Math.max(150, Math.min(1000, earliest - now));
         run.phase = `等待重试 · 还差 ${pending.size} 个 · ${Math.max(1, Math.ceil((earliest - now) / 1000))} 秒后重试`;
-        this.persistRun(run);
-        this.store.upsertRunMeta(run);
+        // 等待期间 results 一个字都不变：进度文字只走 SSE 推送就够，
+        // 全量 run JSON（含全部回答正文）+ state.json 每秒各写一份是纯浪费——
+        // 默认 60 分钟等待窗口原来是 ~3600 次全量串行写盘，这里节流到 30 秒一次。
+        if (Date.now() - lastWaitPersist >= 30_000) {
+          lastWaitPersist = Date.now();
+          this.persistRun(run);
+          this.store.upsertRunMeta(run);
+        }
         this.bus.emitState();
         await this.sleepPolling(waitMs);
         continue;

@@ -1,9 +1,8 @@
 ﻿# AI Flow Launcher (self-healing)
-# Starts AI Flow. If a backend left over from a previous crash still holds the
-# single-instance mutex, this cleans it up first so the app does not fail silently.
-#
-# 用法：双击 AI Flow 启动器.cmd 即可（本文件由它调用）。
-# 如果双击 exe 没反应，用这个启动器，它会自动清理残留进程。
+# 1) If any AI Flow backend responds to /api/health, just open its page (never kill a healthy instance).
+# 2) Otherwise kill leftover backends that are not responding (they still hold the single-instance
+#    mutex, which is why double-clicking AI Flow.exe can do nothing).
+# 3) Start AI Flow and wait until the service really responds.
 
 $ErrorActionPreference = 'SilentlyContinue'
 $AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -18,9 +17,25 @@ function Test-Health([int]$Port) {
     } catch { return $false }
 }
 
-function Get-ListeningPort {
-    if (-not (Test-Path $DesktopJson)) { return 0 }
-    try { return [int](Get-Content $DesktopJson -Raw | ConvertFrom-Json).port } catch { return 0 }
+function Get-ListeningPort([int]$ProcessId) {
+    $conn = Get-NetTCPConnection -State Listen -OwningProcess $ProcessId -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($conn) { return [int]$conn.LocalPort }
+    return 0
+}
+
+# 任何目录下的 AI Flow 后端（路径里可能是 "AI Flow" 也可能是 "AI-Flow"）
+function Get-AiFlowBackends {
+    Get-CimInstance Win32_Process -Filter "Name='node.real.exe' OR Name='node.exe'" |
+        Where-Object {
+            $_.CommandLine -and
+            $_.CommandLine -match 'server\.mjs' -and
+            $_.CommandLine -match '(?i)AI[ -]?Flow'
+        } | ForEach-Object {
+            [pscustomobject]@{
+                ProcessId = $_.ProcessId
+                Port      = Get-ListeningPort $_.ProcessId
+            }
+        }
 }
 
 Write-Host '========================================' -ForegroundColor Cyan
@@ -34,39 +49,53 @@ if (-not (Test-Path $Exe)) {
     exit 1
 }
 
-$port = Get-ListeningPort
-if ($port -gt 0 -and (Test-Health $port)) {
-    Write-Host "AI Flow 已在运行（端口 $port），正在打开窗口..." -ForegroundColor Green
-    Start-Process "http://127.0.0.1:$port/"
+# ---------- 1. 已有能响应的实例：直接打开（绝不杀正常实例）----------
+$backends = @(Get-AiFlowBackends)
+$live = $backends | Where-Object { $_.Port -gt 0 -and (Test-Health $_.Port) } | Select-Object -First 1
+if (-not $live) {
+    # 启动瞬间端口刚起还没响应：最多等 6 秒
+    $starting = $backends | Where-Object { $_.Port -gt 0 } | Select-Object -First 1
+    if ($starting) {
+        for ($i = 0; $i -lt 3; $i++) {
+            Start-Sleep -Seconds 2
+            if (Test-Health $starting.Port) { $live = $starting; break }
+        }
+    }
+}
+if ($live) {
+    Write-Host "AI Flow 已在运行（端口 $($live.Port)），正在打开窗口..." -ForegroundColor Green
+    Start-Process "http://127.0.0.1:$($live.Port)/"
     Start-Sleep -Seconds 2
     exit 0
 }
 
-Write-Host '检查残留进程...'
-$stale = Get-CimInstance Win32_Process -Filter "Name='node.real.exe' OR Name='node.exe'" |
-    Where-Object { $_.CommandLine -and $_.CommandLine -like '*server.mjs*' -and $_.CommandLine -like '*AI Flow*' }
-
-if ($stale) {
-    foreach ($proc in $stale) {
-        Write-Host ("  清理残留进程 PID {0}" -f $proc.ProcessId) -ForegroundColor Yellow
+# ---------- 2. 清理连不上的残留后端（它们占着单实例锁）----------
+if ($backends.Count -gt 0) {
+    foreach ($proc in $backends) {
+        if ($proc.Port -gt 0 -and (Test-Health $proc.Port)) { continue }
+        Write-Host ("  清理残留后端 PID {0}" -f $proc.ProcessId) -ForegroundColor Yellow
         Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
     }
     Write-Host '等待锁释放...'
     Start-Sleep -Seconds 3
 } else {
-    Write-Host '  没有残留进程。'
+    Write-Host '检查残留进程... 没有残留进程。'
 }
 
 if (Test-Path $DesktopJson) { Remove-Item $DesktopJson -Force -ErrorAction SilentlyContinue }
 
+# ---------- 3. 启动 ----------
 Write-Host '正在启动 AI Flow...'
 Start-Process -FilePath $Exe
 
 Write-Host '等待服务就绪...'
 $ok = $false
+$port = 0
 for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Seconds 2
-    $port = Get-ListeningPort
+    if (Test-Path $DesktopJson) {
+        try { $port = [int](Get-Content $DesktopJson -Raw | ConvertFrom-Json).port } catch { $port = 0 }
+    }
     if ($port -gt 0 -and (Test-Health $port)) { $ok = $true; break }
     Write-Host -NoNewline '.'
 }

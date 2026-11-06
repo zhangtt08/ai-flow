@@ -20,6 +20,19 @@ export function readJson(file, fallback = null) {
   }
 }
 
+function syncSleep(ms) {
+  try {
+    // Windows 上等文件句柄释放：Atomics.wait 让线程真正休眠，
+    // 不像空转循环那样把一个核烧满（EBUSY 重试窗口最长 120ms）。
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    const until = Date.now() + ms;
+    while (Date.now() < until) {
+      // 某些环境不允许 Atomics.wait，退回空转
+    }
+  }
+}
+
 function replaceWithRetry(from, to) {
   const attempts = 6;
   for (let index = 0; index < attempts; index += 1) {
@@ -28,11 +41,7 @@ function replaceWithRetry(from, to) {
       return true;
     } catch (error) {
       if (!['EPERM', 'EBUSY', 'EACCES', 'ENOTEMPTY'].includes(error.code) || index === attempts - 1) throw error;
-      const wait = 20 * (index + 1);
-      const until = Date.now() + wait;
-      while (Date.now() < until) {
-        // 在 Windows 上短暂等待文件句柄释放
-      }
+      syncSleep(20 * (index + 1));
     }
   }
   return false;
